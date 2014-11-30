@@ -1,0 +1,165 @@
+#!/bin/bash
+E=0
+VERSION="1.4"
+
+#. Changelog...
+#. v1.4: Removed PKG, and allow any arbitrary @VAR@ variable
+#. v1.3: Look for .describe instead of just ${PKG} environment variable
+#.       Remobe the unnecessary blank line at the top of file
+#. v1.2: Dodgy support on Mac OS X
+#. v1.1: Auto-Serial
+
+################################################################################
+STAT_FMT=
+DATE_FMT=
+stat > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    STAT_FMT="stat -f %%m %s"
+    DATE_FMT="date -jnu -f %%s %d +%%Y%%m%%d"
+    SED=`which gsed` 2>/dev/null
+    if [ $? -ne 0 ]; then
+        echo "Please install GNU sed."
+        E=1
+    fi
+else
+    STAT_FMT="stat -c %%Y %s"
+    DATE_FMT="date +%%Y%%m%%d -d @%d"
+    SED=`which sed`
+fi
+export STAT_FMT
+export DATE_FMT
+function STAT() { CMD=$(printf "${STAT_FMT}" $1); ${CMD}; }
+function DATE() { CMD=$(printf "${DATE_FMT}" $1); ${CMD}; }
+
+AUTOHEADER=
+CWD=$(pwd)
+while [ -z "${AUTOHEADER}" ] && [ ${CWD} != '/' ]; do
+    if [ -f ${CWD}/.autoheader ]; then
+        AUTOHEADER=${CWD}/.autoheader
+    else
+        CWD=$(dirname ${CWD})
+    fi
+done
+
+declare -a VARS
+if [ -f ${CWD}/.describe ]; then
+    source ${CWD}/.describe
+    VARS=( $(awk -F= '{print$1}' ${CWD}/.describe) )
+fi
+
+if [ $E -ne 0 ]; then
+    exit 1;
+fi
+
+################################################################################
+ENC_REGEX="coding[:=]\s*([-\w.]+)"
+if [ $# -eq 1 ]; then
+  if [ -f $1 ]; then
+    if [ ! -z "${AUTOHEADER}" ]; then
+      SERIAL=$(DATE $(STAT ${AUTOHEADER}))
+      ENC="utf-8"
+      SYN=
+      FILETYPE=$(file $1)
+      HASHBANG=$(awk 'NR>1{exit}; $1 ~ /^#\!/ { print $0 }' $1)
+      if [ ! -z "${HASHBANG}" ]; then
+        SYN=$(awk -F'[/ ]' 'NR>1{exit}; $1 ~ /^#\!/ { print $NF }' $1)
+      else
+        $(echo $FILETYPE|grep -q " python ") && SYN="python"
+        $(echo $FILETYPE|grep -q " php ")    && SYN="php"
+      fi
+
+      if [ -z "${SYN}" ]; then
+        ( echo $1 | grep -qE 'CMake.*.txt$' ) && SYN=cmake
+      fi
+
+      if [ -z "${SYN}" ]; then
+        SYN=$(echo $1 | awk -F'.' '{print $NF}')
+        test ${SYN} = "TEMPLATE" && SYN=$(echo $1 | awk -F'.' '{print $(NF - 1)}')
+        test ${SYN} = "py" && SYN=python
+        test ${SYN} = "h" && SYN=c
+        test ${SYN} = "m" && SYN=c
+      fi
+
+      if [ ! -z "${SYN}" ]; then
+        #. Revert the file (no header)...
+        LN=0
+        if [ ! -z "${HASHBANG}" ]; then
+          LN=$(awk '$1 ~ /^#!/ { print FNR-1; exit }' $1)
+          ${SED} -i "/AUTOHEADER START/,/AUTOHEADER END/ { D };1s|${HASHBANG}||" $1
+          echo ${HASHBANG} > $1.tmp;
+        else
+          ${SED} -i "/AUTOHEADER START/,/AUTOHEADER END/ { D };" $1
+          #truncate --size 0 $1.tmp;
+          echo -n > $1.tmp
+        fi
+
+        HEADER_EXISTS=$(awk "{if(\$1~/AUTOHEADER START/){print 1}else{print 0};exit}" $1)
+        HEADER_UPDATE=$(awk "{if(\$1~/AUTOHEADER START v${VERSION}/){print 1}else{print 0};exit}" $1)
+        JOIN=0
+
+        COMMENT="#. "
+        H=
+        F=
+        if [ "${SYN}" = "python" ]; then
+          COMMENT="#. "
+        elif [ "${SYN}" = "c" ]; then
+          COMMENT=" *. "
+          H="/*. ******* coding:${ENC} AUTOHEADER START v${VERSION} *******"
+          F="${COMMENT}******* AUTOHEADER END v${VERSION} ******* */"
+        elif [ "${SYN}" = "php" ]; then
+          COMMENT=" *. "
+          H="<?php /* ******* coding:${ENC} AUTOHEADER START v${VERSION} *******"
+          test ${HEADER_EXISTS} -eq 0 && JOIN=$(awk '{if($1~/^<\?php/){print 1}else{print 0};exit}' $1)
+
+          if [ ${JOIN} -eq 0 ] && [ ${HEADER_EXISTS} -eq 1 ]; then
+            F="${COMMENT}******* AUTOHEADER END v${VERSION} ******* */ ?>"
+          else
+            F="${COMMENT}******* AUTOHEADER END v${VERSION} ******* */"
+          fi
+        fi
+
+        H="${H:-"${COMMENT}******* coding:${ENC} AUTOHEADER START v${VERSION} *******"}"
+        F="${F:-"${COMMENT}******* AUTOHEADER END v${VERSION} *******"}"
+
+
+
+        printf "%s\n" "${H}" >> $1.tmp
+        echo -e "${COMMENT}vim: fileencoding=${ENC} ${SYN:+syntax=${SYN}} sw=4 ts=4 et" >> $1.tmp
+        ${SED} -e "s:@SERIAL@:${SERIAL}:g;s:^.*:${COMMENT}&:;s: \+$::" ${AUTOHEADER} >> $1.tmp;
+        for var in ${VARS[@]}; do
+            ${SED} -e "s:@${var}@:${!var}:g;" $1.tmp >> $1._tmp;
+            mv $1._tmp $1.tmp
+        done
+        printf "%s\n\n" "${F}" >> $1.tmp
+
+        ${SED} -i '/./,$!d' $1
+        if [ ${LN} -gt 0 ]; then
+          ${SED} -i "1,${LN}d" $1
+        fi
+
+        awk "NR>${JOIN}{print}" $1 >> $1.tmp
+
+        #. TODO...
+        #if [ "${SYN}" = "php" ]; then
+        #  ${SED} -i -e :a -e '$!N;s/\n/AH_EOL/;ta' -e 's/?>\(AH_EOL\| \)*<?php/?><?php/' -e 's/AH_EOL/\n/g' $1.tmp;
+        #fi
+
+        mv $1.tmp $1
+      else
+        echo -e "Error: Sorry, could not determine file type."
+        E=4
+      fi
+    else
+      echo "Error: Could not locate \`.autoheader' anywhere up the path tree."
+      E=3
+    fi
+  else
+    echo -e "No such file."
+    E=2
+  fi
+else
+  echo "Usage: $0 <file>"
+  E=1
+fi
+
+exit ${E}
